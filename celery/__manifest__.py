@@ -34,5 +34,5 @@
         'static/description/banner.png',
     ],
     'installable': True,
-    'application' : True,
+    'application': True,
 }

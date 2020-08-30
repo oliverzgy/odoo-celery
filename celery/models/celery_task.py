@@ -63,10 +63,15 @@ RETRY_COUNTDOWN_SETTINGS = [
 
 
 def _get_celery_user_config():
-    user = (os.environ.get('ODOO_CELERY_USER') or config.misc.get("celery", {}).get('user') or config.get('celery_user'))
-    password = (os.environ.get('ODOO_CELERY_PASSWORD') or config.misc.get("celery", {}).get('password') or config.get('celery_password'))
-    sudo = (os.environ.get('ODOO_CELERY_SUDO') or config.misc.get("celery", {}).get('sudo') or config.get('celery_sudo'))
+    user = (os.environ.get('ODOO_CELERY_USER') or config.misc.get("celery", {}).get('celery_user') or config.get('celery_user'))
+    password = (os.environ.get('ODOO_CELERY_PASSWORD') or config.misc.get("celery", {}).get('celery_password') or config.get('celery_password'))
+    sudo = (os.environ.get('ODOO_CELERY_SUDO') or config.misc.get("celery", {}).get('celery_sudo') or config.get('celery_sudo'))
     return (user, password, sudo)
+
+
+def _get_celery_queue_config():
+    queue = (os.environ.get('ODOO_CELERY_QUEUE') or config.misc.get("celery", {}).get('celery_queue') or config.get('celery_queue'))
+    return queue
 
 
 class CeleryTask(models.Model):
@@ -79,6 +84,7 @@ class CeleryTask(models.Model):
     uuid = fields.Char(string='UUID', readonly=True, index=True, required=True)
     queue = fields.Char(string='Queue', readonly=True, required=True, default=TASK_DEFAULT_QUEUE, index=True)
     user_id = fields.Many2one('res.users', string='User ID', required=True, readonly=True)
+    owner_id = fields.Many2one('res.users', string="Owner ID", readonly=True)
     company_id = fields.Many2one('res.company', string='Company', index=True, readonly=True)
     model = fields.Char(string='Model', readonly=True)
     method = fields.Char(string='Method', readonly=True)
@@ -213,6 +219,7 @@ class CeleryTask(models.Model):
         user, password, sudo = _get_celery_user_config()
         res_users = self.env['res.users'].with_context(active_test=False)
         user_id = res_users.search_read([('login', '=', user)], fields=['id'], limit=1)
+
         if not user_id:
             msg = _('The user "%s" doesn\'t exist.') % user
             logger.error(msg)
@@ -220,9 +227,12 @@ class CeleryTask(models.Model):
         
         user_id = user_id[0]['id']
         task_uuid = str(uuid.uuid4())
+        owner_id = self.env.user.id
+
         vals = {
             'uuid': task_uuid,
             'user_id': user_id,
+            'owner_id': owner_id,
             'model': model,
             'method': method,
             # The task (method/implementation) kwargs, needed in the rpc_run_task model/method.
@@ -230,7 +240,14 @@ class CeleryTask(models.Model):
 
         scheduled_date = False
         # queue selection
-        default_queue = kwargs.get('celery', False) and kwargs.get('celery').get('queue', '') or 'celery'
+        # default_queue = kwargs.get('celery', False) and kwargs.get('celery').get('queue', '') or 'celery'
+        default_queue = _get_celery_queue_config()
+
+        if not default_queue:
+            msg = _('The default_queue doesn\'t exist.')
+            logger.error(msg)
+            return False
+
         task_queue = False
         task_setting_domain = [('model', '=', model), ('method', '=', method), ('active', '=', True)]
         task_setting = self.env['celery.task.setting'].sudo().search(task_setting_domain, limit=1)
@@ -303,7 +320,7 @@ class CeleryTask(models.Model):
                     env = api.Environment(cr, user_id, {})
                     Task = env['celery.task']
                     if not scheduled_date:  # if the task is not scheduled for a later time
-                        Task._celery_call_task(user_id, task_uuid, model, method, kwargs)
+                        Task._celery_call_task(user_id, owner_id, task_uuid, model, method, kwargs)
 
         if transaction_strategy == 'immediate':
             apply_call_task()
@@ -357,10 +374,10 @@ class CeleryTask(models.Model):
         return transaction_strategy
 
     @api.model
-    def _celery_call_task(self, user_id, uuid, model, method, kwargs):
+    def _celery_call_task(self, user_id, owner_id, uuid, model, method, kwargs):
         user, password, sudo = _get_celery_user_config()
         url = self.env['ir.config_parameter'].sudo().get_param('celery.celery_base_url')
-        _args = [url, self._cr.dbname, user_id, uuid, model, method]
+        _args = [url, self._cr.dbname, user_id, owner_id, uuid, model, method]
 
         if not kwargs.get('_password'):
             kwargs['_password'] = password
@@ -387,7 +404,7 @@ class CeleryTask(models.Model):
         call_task.apply_async(args=_args, kwargs=kwargs, kwargsrepr=_kwargsrepr, **kwargs['celery'])
 
     @api.model
-    def rpc_run_task(self, task_uuid, model, method, *args, **kwargs):
+    def rpc_run_task(self, owner_id, task_uuid, model, method, context, *args, **kwargs):
         """Run/execute the task, which is a model method.
 
         The idea is that Celery calls this by Odoo its external API,
@@ -399,8 +416,9 @@ class CeleryTask(models.Model):
         - "admin" (Odoo admin user), to circumvent model-access configuration for models
         which run/process task. Therefor add "sudo = True" in the odoo.conf (see: example.odoo.conf).
         """
-
-        task_queue = kwargs.get('celery', False) and kwargs.get('celery').get('queue', '') or 'celery'
+        args_frm_kwargs = kwargs.get('args')
+        del kwargs['args']
+        task_queue = kwargs.get('celery', False) and kwargs.get('celery').get('queue', '') or TASK_DEFAULT_QUEUE or 'celery'
         task_ref = kwargs.get('celery_task_vals', False) and kwargs.get('celery_task_vals').get('ref', '') or ''
         logger.info('CELERY rpc_run_task uuid:{uuid} - model: {model} - method: {method} - ref: {ref} - queue: {queue}'.format(
             uuid=task_uuid,
@@ -442,10 +460,31 @@ class CeleryTask(models.Model):
             # Transaction/cursror for the exception handler.
             env = api.Environment(cr, self._uid, {})
             try:
+                model_method = getattr(model_obj, method)
+                model_obj = model_obj.with_env(env).with_context(context)
+                del kwargs['celery']
+                del kwargs['celery_task_vals']
+                del kwargs['transaction_strategy']
+
                 if bool(sudo) and sudo:
-                    res = getattr(model_obj.with_env(env).sudo(), method)(task_uuid, **kwargs)
+                    # res = getattr(model_obj.with_env(env).sudo(), method)(task_uuid, **kwargs)
+                    model_obj = model_obj.sudo()
+
                 else:
-                    res = getattr(model_obj.with_env(env), method)(task_uuid, **kwargs)
+                    # res = getattr(model_obj.with_env(env), method)(task_uuid, **kwargs)
+                    model_obj = model_obj.with_user(owner_id)
+
+                if hasattr(model_method, '_api') and model_method._api in ['model']:
+                    res = getattr(model_obj, method)(*args_frm_kwargs, **kwargs)
+
+                else:
+                    if not isinstance(args_frm_kwargs[0], int):
+                        msg = "当前方法data第一个参数必须为id"
+                        logger.error(msg)
+                        raise CeleryCallTaskException(msg)
+
+                    model_rec = model_obj.browse(args_frm_kwargs[0])
+                    res = getattr(model_rec, method)(*args_frm_kwargs[1:], **kwargs)
 
                 if res != False and not bool(res):
                     msg = "No result/return value for Task UUID: %s. Ensure the task-method returns a value." % task_uuid
@@ -550,7 +589,7 @@ class CeleryTask(models.Model):
                 task.action_pending()
                 try:
                     _kwargs = json.loads(task.kwargs)
-                    self._celery_call_task(task.user_id.id, task.uuid, task.model, task.method, _kwargs)
+                    self._celery_call_task(task.user_id.id, task.owner_id.id, task.uuid, task.model, task.method, _kwargs)
                 except CeleryCallTaskException as e:
                     logger.error(_('ERROR IN requeue %s: %s') % (task.uuid, e))
         return True

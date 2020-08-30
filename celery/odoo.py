@@ -2,7 +2,7 @@
 # License LGPL-3.0 or later (http://www.gnu.org/licenses/lgpl.html)
 
 import copy
-
+import os
 from celery import Celery
 from celery.contrib import rdb
 from celery.exceptions import TaskError, Retry, MaxRetriesExceededError
@@ -11,7 +11,13 @@ from xmlrpc import client as xmlrpc_client
 
 logger = get_task_logger(__name__)
 
-TASK_DEFAULT_QUEUE = 'celery'
+try:
+    from odoo.tools import config  # don't remove try, before server start, there are have not config
+except Exception as e:
+    logger.error(e)
+
+TASK_DEFAULT_QUEUE = os.environ.get('ODOO_CELERY_QUEUE') or config.misc.get("celery", {}).get('celery_queue') \
+                     or config.get('celery_queue') or 'celery_queue'
 
 OK_CODE = 'OK'
 
@@ -28,16 +34,25 @@ RETRY_COUNTDOWN_MULTIPLY_RETRIES_SECCONDS = 'MUL_RETRIES_SECS'
 class TaskNotFoundInOdoo(TaskError):
     """The task doesn't exist (anymore) in Odoo (Celery Task model)."""
 
+
 class RunTaskFailure(TaskError):
     """Error from rpc_run_task in Odoo."""
 
 
-app = Celery('odoo.addons.celery')
+broker = os.environ.get('ODOO_CELERY_BROKER') or config.misc.get("celery", {}).get('celery_broker') \
+         or config.get('celery_broker') or "amqp://guest@localhost//"
+
+if not broker:
+    raise ValueError
+
+app = Celery('odoo.addons.celery', broker=broker)
+
 
 @app.task(name='odoo.addons.celery.odoo.call_task', bind=True)
-def call_task(self, url, db, user_id, task_uuid, model, method, **kwargs):
+def call_task(self, url, db, user_id, owner_id, task_uuid, model, method, **kwargs):
     odoo = xmlrpc_client.ServerProxy('{}/xmlrpc/2/object'.format(url))
-    args = [task_uuid, model, method]
+    context = kwargs.pop('context')
+    args = [owner_id, task_uuid, model, method, context]
     _kwargs = copy.deepcopy(kwargs)
 
     # Needed in the retry (call), to hide _password.
@@ -93,10 +108,10 @@ def call_task(self, url, db, user_id, task_uuid, model, method, **kwargs):
                 elif retry_countdown_setting == RETRY_COUNTDOWN_MULTIPLY_RETRIES:
                     countdown = countdown * self.request.retries
                 elif retry_countdown_setting == RETRY_COUNTDOWN_MULTIPLY_RETRIES_SECCONDS \
-                     and retry_countdown_multiply_retries_seconds > 0:
+                        and retry_countdown_multiply_retries_seconds > 0:
                     countdown = self.request.retries * retry_countdown_multiply_retries_seconds
             celery_params['countdown'] = countdown
-            
+
             if retry:
                 msg = 'Retry task... Failure in Odoo {db} (task: {uuid}, model: {model}, method: {method}).'.format(
                     db=db, uuid=task_uuid, model=model, method=method)
@@ -108,7 +123,7 @@ def call_task(self, url, db, user_id, task_uuid, model, method, **kwargs):
                 _kwargsrepr = repr(_kwargsrepr)
                 raise self.retry(kwargsrepr=_kwargsrepr, **celery_params)
             else:
-                msg = 'Exit task... Failure in Odoo {db} (task: {uuid}, model: {model}, method: {method})\n'\
+                msg = 'Exit task... Failure in Odoo {db} (task: {uuid}, model: {model}, method: {method})\n' \
                       '  => Check task log/info in Odoo'.format(db=db, uuid=task_uuid, model=model, method=method)
                 logger.info(msg)
         else:
@@ -147,7 +162,7 @@ def call_task(self, url, db, user_id, task_uuid, model, method, **kwargs):
             # odoo.execute_kw(db, user_id, password, 'celery.task', 'rpc_set_exception', args)
             #
             # Necessary to implement/call a retry() for other exceptions ?
-            msg = '{exception}\n'\
+            msg = '{exception}\n' \
                   '  => SUGGESTIONS: Check former XML-RPC log messages.\n'.format(exception=e)
             logger.error(msg)
             raise e
